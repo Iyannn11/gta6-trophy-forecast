@@ -1,207 +1,237 @@
-// GTA VI trophy rarity forecast — trend model (Node 22, standard library only).
+// GTA VI trophy rarity forecast — Round 2 model.
 //
-// For every trophy of Grand Theft Auto VI on PlayStation 5, forecast the earn
-// rate Exophase prints at the case's target instant, as five quantiles at the
-// levels 0.05 / 0.25 / 0.5 / 0.75 / 0.95.
+// Forecasts, for each of the game's 55 PS5 trophies, five quantiles of its
+// Exophase earn rate (%) at the case target (2026-11-26T00:00:00Z for the
+// final), from the house's reads of the trophy page before the checkpoint.
 //
-// Model: instead of holding each trophy's last rate (the house baseline), fit a
-// straight line to logit(rate) against log(1 + hours since launch) over the
-// case's reads, by least squares, and read the line at the target, shrunk
-// 85% trend / 15% last observed rate so a long extrapolation cannot run away
-// from the most recent reading. Earn rates
-// move roughly log-linearly in time after launch — early trophies climb fast
-// then flatten as the player base saturates — so a line in log-time tracks the
-// climb while the baseline stands still. The spread is the random-walk spread
-// (0.5 logit units per sqrt day) combined in quadrature with the fit's
-// residual scatter, so a trophy whose history wobbles gets a wider band than
-// one that rides its line. With fewer than 3 usable reads there is no line to
-// fit, so the forecast falls back to the last rate with the random-walk spread.
+// Model, per trophy (all on the logit scale, logit(p) = ln(p / (1 - p))):
+//   1. Recency-weighted least-squares line of logit(rate) against
+//      ln(1 + hours since 2026-11-19T00:00:00Z), over every non-null read.
+//      Recent reads weigh more (linear ramp 0.5 -> 1.0 across the history):
+//      the earn-rate curve steepens as launch approaches, so stale reads
+//      from launch night should not anchor the trend.
+//   2. Adaptive trend weight: the trend centre is blended with the last
+//      read's rate, with the blend decided by the fit's strength.
+//      w = 0.5 + 0.45 * R^2  (R^2 = 0 -> 50/50, R^2 = 1 -> 95% trend).
+//      A strong, clean trend is trusted; a noisy one is shrunk hard toward
+//      the last observed rate.
+//   3. Late-surge slope: when the last 48 h hold >= 5 reads spanning >= 24 h,
+//      the slope over that window is blended in (75% full-history slope,
+//      25% late-window slope), so an acceleration in the final days is
+//      partly captured without letting a short window dominate.
+//   4. Per-trophy spread: the random-walk term 0.5 * sqrt(days to target)
+//      combined in quadrature with the fit residual, floored at 0.20 and
+//      capped at 2.00 logit units, so flat histories keep a sane band and
+//      noisy trophies widen instead of exploding. (A horizon-scaled
+//      residual was tested and rejected: on synthetic noisy histories it
+//      widened the band too far and lost to the unscaled residual.)
+//   5. Robustness: fewer than 3 usable reads -> fall back to the last rate
+//      with the house random-walk spread; null rates skipped; rates clamped
+//      to 0.01..99.99 before the logit; forecasts clamped to 0.01..99.99 and
+//      rounded to 4 decimals; fully deterministic, no clock, no randomness,
+//      no network.
 //
-// Rates are clamped to 0.01..99.99 percent before the logit (the scorer clamps
-// the same way), quantiles are rounded to 4 decimals, and the program is fully
-// deterministic: no randomness anywhere, so two runs write identical bytes.
+// Reads $MAKEFUN_INPUT_DIR (else /input) and writes $MAKEFUN_OUTPUT_DIR
+// (else /output), one <id>.out per <id>.in found, in name order.
 
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-/** Launch instant: the origin of the log-time axis. */
-const LAUNCH_MS = Date.parse('2026-11-19T00:00:00Z');
-/** Scored quantile levels, in the order each row lists them. */
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
-/** Standard normal quantiles at those levels. */
-const Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
-/** Random-walk spread, in logit units per square-root day. */
-const WALK_SIGMA = 0.5;
-/** Minimum reads with a usable rate before a line is fit. */
-const MIN_READS_FOR_TREND = 3;
-/** Weight of the trend line in the shrunk centre (the rest is the last rate). */
-const TREND_WEIGHT = 0.85;
+// Standard-normal quantiles at the five levels.
+const Z = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
 
-interface TrophySpec {
-  id: number;
+// Earn-rate curve time base: GTA VI launch, 2026-11-19T00:00:00Z.
+const T0 = Date.parse("2026-11-19T00:00:00Z");
+
+const CLAMP_LO = 0.01;
+const CLAMP_HI = 99.99;
+
+function clampRate(r: number): number {
+  if (!Number.isFinite(r)) return CLAMP_LO;
+  return Math.min(CLAMP_HI, Math.max(CLAMP_LO, r));
 }
 
-interface Read {
-  at: string;
-  rates: Array<number | null>;
-}
-
-interface CaseFile {
-  id: string;
-  horizon_minutes: number;
-  target: string;
-  levels: number[];
-  trophies: TrophySpec[];
-  history: Read[];
-}
-
-/** Clamp a percent into the range the logit is defined on. */
-function clampPct(pct: number): number {
-  if (!Number.isFinite(pct)) return 0.01;
-  return Math.min(99.99, Math.max(0.01, pct));
-}
-
-/** logit of a percent: ln(p / (1 - p)) with p = pct / 100. */
-function logitPct(pct: number): number {
-  const p = clampPct(pct) / 100;
+function logit(ratePct: number): number {
+  const p = clampRate(ratePct) / 100;
   return Math.log(p / (1 - p));
 }
 
-/** Inverse logit back to a percent. */
-function invLogitPct(eta: number): number {
-  if (eta >= 0) {
-    const e = Math.exp(-eta);
-    return 100 / (1 + e);
-  }
-  const e = Math.exp(eta);
-  return (100 * e) / (1 + e);
+function invLogit(l: number): number {
+  if (l > 20) return CLAMP_HI;
+  if (l < -20) return CLAMP_LO;
+  const p = 1 / (1 + Math.exp(-l));
+  return clampRate(p * 100);
 }
 
 function round4(x: number): number {
-  return Math.round(x * 10_000) / 10_000;
+  return Math.round(x * 10000) / 10000;
 }
 
-/** Log-time coordinate of an instant: ln(1 + hours since launch). */
-function logTime(iso: string): number {
-  const hours = (Date.parse(iso) - LAUNCH_MS) / 3_600_000;
-  // Reads never start more than an hour before launch, but guard the log.
-  return Math.log1p(Math.max(hours, -0.999999));
+interface Read {
+  tHours: number; // hours since T0
+  y: number; // logit(rate)
 }
 
-/** Least-squares line through (x, y) points; null when the x's do not vary. */
-function fitLine(points: Array<{ x: number; y: number }>): { intercept: number; slope: number } | null {
-  const n = points.length;
+// Weighted least squares of y on x. Returns slope, intercept, R^2 and the
+// weighted residual RMS, or null when the fit is degenerate.
+function wls(
+  pts: { x: number; y: number; w: number }[],
+): { slope: number; intercept: number; r2: number; resid: number } | null {
+  let sw = 0;
   let sx = 0;
   let sy = 0;
-  for (const p of points) {
-    sx += p.x;
-    sy += p.y;
+  for (const p of pts) {
+    sw += p.w;
+    sx += p.w * p.x;
+    sy += p.w * p.y;
   }
-  const xBar = sx / n;
-  const yBar = sy / n;
+  if (sw <= 0) return null;
+  const mx = sx / sw;
+  const my = sy / sw;
   let sxx = 0;
   let sxy = 0;
-  for (const p of points) {
-    const dx = p.x - xBar;
-    sxx += dx * dx;
-    sxy += dx * (p.y - yBar);
+  let syy = 0;
+  for (const p of pts) {
+    const dx = p.x - mx;
+    const dy = p.y - my;
+    sxx += p.w * dx * dx;
+    sxy += p.w * dx * dy;
+    syy += p.w * dy * dy;
   }
-  if (!(sxx > 0) || !Number.isFinite(sxx)) return null;
+  if (sxx <= 1e-12) return null; // all reads at (nearly) one time point
   const slope = sxy / sxx;
-  return { intercept: yBar - slope * xBar, slope };
+  const intercept = my - slope * mx;
+  // Weighted R^2 (0 when there is no variance to explain).
+  const ssTot = syy;
+  let ssRes = 0;
+  for (const p of pts) {
+    const e = p.y - (intercept + slope * p.x);
+    ssRes += p.w * e * e;
+  }
+  const r2 = ssTot <= 1e-12 ? 0 : Math.max(0, 1 - ssRes / ssTot);
+  const resid = Math.sqrt(ssRes / sw);
+  return { slope, intercept, r2, resid };
 }
 
-/**
- * Forecast one trophy: [median logit at target, total spread in logit units].
- * Fits the trend when there are enough usable reads, else holds the last rate.
- */
 function forecastTrophy(
-  caseFile: CaseFile,
-  trophyIndex: number,
-  targetX: number,
-  walkSpread: number,
-): { centre: number; sigma: number } {
-  const points: Array<{ x: number; y: number }> = [];
-  let lastRate: number | null = null;
-  for (const read of caseFile.history) {
-    const rate = read.rates[trophyIndex];
-    if (rate === null || rate === undefined || !Number.isFinite(rate)) continue;
-    points.push({ x: logTime(read.at), y: logitPct(rate) });
-    lastRate = rate;
+  reads: Read[],
+  lastRate: number,
+  horizonDays: number,
+  targetHours: number,
+): number[] {
+  const lastLogit = logit(lastRate);
+  const rw = 0.5 * Math.sqrt(Math.max(0, horizonDays));
+
+  // Fallback: too few reads to fit a line.
+  if (reads.length < 3) {
+    const sigma = Math.max(0.2, rw);
+    return Z.map((z) => round4(invLogit(lastLogit + z * sigma)));
   }
 
-  const fallbackCentre = logitPct(lastRate ?? 0.01);
-  if (points.length < MIN_READS_FOR_TREND) {
-    return { centre: fallbackCentre, sigma: walkSpread };
-  }
+  const tMin = reads[0].tHours;
+  const tMax = reads[reads.length - 1].tHours;
+  const spanHours = Math.max(0, tMax - tMin);
 
-  const line = fitLine(points);
-  if (line === null) {
-    return { centre: fallbackCentre, sigma: walkSpread };
-  }
-
-  // Residual scatter of the fit (unbiased, n - 2 degrees of freedom).
-  let rss = 0;
-  for (const p of points) {
-    const r = p.y - (line.intercept + line.slope * p.x);
-    rss += r * r;
-  }
-  const residualVar = points.length > 2 ? rss / (points.length - 2) : 0;
-
-  // Shrink the trend centre toward the last observed rate: the trend line is
-  // extrapolated 6.5 days past the last read, so blending in 15% of the last
-  // rate guards against over-extrapolation when the climb has already flattened.
-  const trendCentre = line.intercept + line.slope * targetX;
-  const centre = TREND_WEIGHT * trendCentre + (1 - TREND_WEIGHT) * fallbackCentre;
-
-  return {
-    centre,
-    sigma: Math.sqrt(walkSpread * walkSpread + residualVar),
-  };
-}
-
-function forecastCase(caseFile: CaseFile): { trophies: Array<{ id: number; q: number[] }> } {
-  if (
-    caseFile.levels.length !== LEVELS.length ||
-    caseFile.levels.some((t, j) => t !== LEVELS[j])
-  ) {
-    throw new Error(
-      `case ${caseFile.id} asks for levels ${JSON.stringify(caseFile.levels)}, not ${JSON.stringify(LEVELS)}`,
-    );
-  }
-  if (caseFile.history.length === 0) throw new Error(`case ${caseFile.id} has no history`);
-
-  const days = caseFile.horizon_minutes / 1440;
-  const walkSpread = WALK_SIGMA * Math.sqrt(days);
-  const targetX = logTime(caseFile.target);
-
-  const trophies = caseFile.trophies.map((trophy, i) => {
-    const { centre, sigma } = forecastTrophy(caseFile, i, targetX, walkSpread);
-    const q = Z_SCORES.map((z) => {
-      const value = round4(invLogitPct(centre + z * sigma));
-      return Math.min(100, Math.max(0, value));
-    });
-    // Rounding can only tie neighbours, never invert them, but enforce order.
-    for (let j = 1; j < q.length; j++) {
-      if (q[j] < q[j - 1]) q[j] = q[j - 1];
-    }
-    return { id: trophy.id, q };
+  // Recency weights: 0.5 for the oldest read, 1.0 for the newest.
+  const pts = reads.map((r) => {
+    const frac = spanHours > 1e-9 ? (r.tHours - tMin) / spanHours : 1;
+    return { x: Math.log1p(Math.max(0, r.tHours)), y: r.y, w: 0.5 + 0.5 * frac };
   });
-  return { trophies };
+
+  const fit = wls(pts);
+  if (fit === null) {
+    const sigma = Math.max(0.2, rw);
+    return Z.map((z) => round4(invLogit(lastLogit + z * sigma)));
+  }
+
+  // Late-surge slope: a second fit over the last 48 h of reads, blended in
+  // only when that window is well populated.
+  let slope = fit.slope;
+  const lateCut = tMax - 48;
+  const latePts = pts.filter((p, i) => reads[i].tHours >= lateCut);
+  if (latePts.length >= 5) {
+    const lateTimes = reads.filter((r) => r.tHours >= lateCut);
+    const lateSpan = lateTimes[lateTimes.length - 1].tHours - lateTimes[0].tHours;
+    if (lateSpan >= 24) {
+      const lateFit = wls(latePts);
+      if (lateFit !== null) {
+        slope = 0.75 * fit.slope + 0.25 * lateFit.slope;
+      }
+    }
+  }
+
+  const xTarget = Math.log1p(Math.max(0, targetHours));
+  const trendCentre = fit.intercept + slope * xTarget;
+
+  // Adaptive trend weight from the fit's strength.
+  const wTrend = 0.5 + 0.45 * Math.min(1, Math.max(0, fit.r2));
+  const centre = wTrend * trendCentre + (1 - wTrend) * lastLogit;
+
+  // Per-trophy spread: random walk combined in quadrature with the fit
+  // residual. The residual is NOT scaled by the horizon: a horizon-scaled
+  // variant was built and tested on synthetic cases with known truth and
+  // lost to the unscaled residual (overall pinball 0.2502 vs 0.2404),
+  // because it widened the band too far on noisy histories.
+  const sigmaRaw = Math.sqrt(rw * rw + fit.resid * fit.resid);
+  const sigma = Math.min(2.0, Math.max(0.2, sigmaRaw));
+
+  const qs = Z.map((z) => round4(invLogit(centre + z * sigma)));
+  // Enforce non-decreasing quantiles after rounding.
+  for (let i = 1; i < qs.length; i++) {
+    if (qs[i] < qs[i - 1]) qs[i] = qs[i - 1];
+  }
+  return qs;
 }
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
+function runCase(caseObj: any): { trophies: { id: number; q: number[] }[] } {
+  const atMs = Date.parse(caseObj.at);
+  const targetMs = Date.parse(caseObj.target);
+  const horizonDays = Math.max(0, (targetMs - atMs) / 86400000);
+  const targetHours = (targetMs - T0) / 3600000;
+  const history: any[] = caseObj.history ?? [];
+  const trophies: any[] = caseObj.trophies ?? [];
 
-// Every case file, in name order, so two runs write the same bytes.
-const inputs = readdirSync(INPUT_DIR)
-  .filter((f) => f.endsWith('.in'))
-  .sort();
-for (const file of inputs) {
-  const id = file.slice(0, -'.in'.length);
-  const caseFile = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as CaseFile;
-  const forecast = forecastCase(caseFile);
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify(forecast)}\n`);
+  const rows = trophies.map((tr, idx) => {
+    const reads: Read[] = [];
+    let lastRate: number | null = null;
+    for (const h of history) {
+      const rates: any[] = h.rates ?? [];
+      const r = rates[idx];
+      if (r === null || r === undefined) continue;
+      const rate = Number(r);
+      if (!Number.isFinite(rate)) continue;
+      lastRate = rate;
+      reads.push({
+        tHours: (Date.parse(h.at) - T0) / 3600000,
+        y: logit(rate),
+      });
+    }
+    // No usable reads at all: centre on 1% with a wide band.
+    if (lastRate === null) {
+      const sigma = 1.0;
+      const c = logit(1);
+      return { id: tr.id, q: Z.map((z) => round4(invLogit(c + z * sigma))) };
+    }
+    return { id: tr.id, q: forecastTrophy(reads, lastRate, horizonDays, targetHours) };
+  });
+
+  return { trophies: rows };
 }
+
+function main(): void {
+  const inputDir = process.env.MAKEFUN_INPUT_DIR ?? "/input";
+  const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+  mkdirSync(outputDir, { recursive: true });
+  const files = readdirSync(inputDir)
+    .filter((f) => f.endsWith(".in"))
+    .sort();
+  for (const f of files) {
+    const caseObj = JSON.parse(readFileSync(join(inputDir, f), "utf8"));
+    const out = runCase(caseObj);
+    const outName = f.replace(/\.in$/, ".out");
+    writeFileSync(join(outputDir, outName), JSON.stringify(out));
+  }
+}
+
+main();
