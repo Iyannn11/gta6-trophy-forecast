@@ -6,7 +6,9 @@
 //
 // Model: instead of holding each trophy's last rate (the house baseline), fit a
 // straight line to logit(rate) against log(1 + hours since launch) over the
-// case's reads, by least squares, and read the line at the target. Earn rates
+// case's reads, by least squares, and read the line at the target, shrunk
+// 85% trend / 15% last observed rate so a long extrapolation cannot run away
+// from the most recent reading. Earn rates
 // move roughly log-linearly in time after launch — early trophies climb fast
 // then flatten as the player base saturates — so a line in log-time tracks the
 // climb while the baseline stands still. The spread is the random-walk spread
@@ -35,6 +37,8 @@ const Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0, 0.674489750196081
 const WALK_SIGMA = 0.5;
 /** Minimum reads with a usable rate before a line is fit. */
 const MIN_READS_FOR_TREND = 3;
+/** Weight of the trend line in the shrunk centre (the rest is the last rate). */
+const TREND_WEIGHT = 0.85;
 
 interface TrophySpec {
   id: number;
@@ -147,8 +151,14 @@ function forecastTrophy(
   }
   const residualVar = points.length > 2 ? rss / (points.length - 2) : 0;
 
+  // Shrink the trend centre toward the last observed rate: the trend line is
+  // extrapolated 6.5 days past the last read, so blending in 15% of the last
+  // rate guards against over-extrapolation when the climb has already flattened.
+  const trendCentre = line.intercept + line.slope * targetX;
+  const centre = TREND_WEIGHT * trendCentre + (1 - TREND_WEIGHT) * fallbackCentre;
+
   return {
-    centre: line.intercept + line.slope * targetX,
+    centre,
     sigma: Math.sqrt(walkSpread * walkSpread + residualVar),
   };
 }
